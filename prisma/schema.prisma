@@ -1,0 +1,229 @@
+// This is the Prisma schema for Medio.
+// PostGIS geography columns use Unsupported() — raw SQL migrations handle those.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────
+
+enum OrderType {
+  RX
+  OTC
+}
+
+enum OrderStatus {
+  PENDING_FLASH       // Awaiting pharmacy acceptance (flash window open)
+  FLASH_EXPIRED       // Nobody accepted within 3 minutes
+  ACCEPTED            // Pharmacy won the race
+  PACKAGING           // Items being packed + labelled
+  READY_FOR_PICKUP    // Packing done, awaiting rider
+  RIDER_ASSIGNED      // Rider dispatched to pharmacy
+  IN_TRANSIT          // Rider picked up, heading to customer
+  DELIVERED           // Complete
+  CANCELLED           // Cancelled by user or admin
+}
+
+enum UserRole {
+  USER
+  PHARMACY
+  RIDER
+}
+
+// ─────────────────────────────────────────
+// USERS (consumers)
+// ─────────────────────────────────────────
+
+model User {
+  id           String    @id @default(cuid())
+  phone        String    @unique
+  name         String    @default("")
+  email        String?   @unique
+  role         UserRole  @default(USER)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  orders       Order[]
+  addresses    Address[]
+  refreshTokens RefreshToken[]
+
+  @@index([phone])
+}
+
+// ─────────────────────────────────────────
+// ADDRESSES (saved delivery addresses)
+// ─────────────────────────────────────────
+
+model Address {
+  id        String   @id @default(cuid())
+  userId    String
+  label     String   @default("Home") // Home | Work | Other
+  line1     String
+  line2     String?
+  city      String
+  pincode   String
+  lat       Float
+  lng       Float
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────
+// PHARMACIES (partner side)
+// ─────────────────────────────────────────
+
+model Pharmacy {
+  id           String   @id @default(cuid())
+  name         String
+  licenseNo    String   @unique
+  phone        String   @unique
+  passwordHash String
+  role         UserRole @default(PHARMACY)
+  isOnline     Boolean  @default(false)  // toggleable by partner
+  isVerified   Boolean  @default(false)  // admin-verified license
+  isActive     Boolean  @default(true)
+
+  // Geographic location (raw column managed by PostGIS migration)
+  lat          Float
+  lng          Float
+  // location geography(Point,4326) added via raw SQL migration
+
+  addressLine  String
+  city         String
+  pincode      String
+
+  coverageKm   Float    @default(3.0)   // configurable per pharmacy
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orders       Order[]         @relation("PharmacyOrders")
+  refreshTokens RefreshToken[]
+
+  @@index([isOnline])
+  @@index([city])
+}
+
+// ─────────────────────────────────────────
+// RIDERS (delivery side)
+// ─────────────────────────────────────────
+
+model Rider {
+  id           String   @id @default(cuid())
+  name         String
+  phone        String   @unique
+  passwordHash String
+  role         UserRole @default(RIDER)
+  isAvailable  Boolean  @default(true)
+  isActive     Boolean  @default(true)
+
+  // Live location — updated via PUT /rider/location every ~10s
+  lat          Float?
+  lng          Float?
+  // location geography(Point,4326) added via raw SQL migration
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orders       Order[]
+  refreshTokens RefreshToken[]
+
+  @@index([isAvailable])
+}
+
+// ─────────────────────────────────────────
+// ORDERS — the central state machine
+// ─────────────────────────────────────────
+
+model Order {
+  id              String      @id @default(cuid())
+  type            OrderType
+  status          OrderStatus @default(PENDING_FLASH)
+
+  // Relationships
+  userId          String
+  pharmacyId      String?
+  riderId         String?
+
+  // Prescription (Rx only)
+  rxImageUrl      String?     // Cloudinary CDN URL
+  rxImagePublicId String?     // for deletion
+
+  // Order contents (both Rx and OTC)
+  items           Json        // [{ name, qty, dosage, inStock }]
+
+  // Delivery
+  deliveryLat     Float
+  deliveryLng     Float
+  deliveryAddress String
+
+  // Flash window
+  flashExpiresAt  DateTime    // createdAt + FLASH_WINDOW_SECONDS
+
+  // Timestamps for each state transition
+  acceptedAt      DateTime?
+  packagingStartAt DateTime?
+  packedAt        DateTime?
+  riderAssignedAt DateTime?
+  pickedUpAt      DateTime?
+  deliveredAt     DateTime?
+  cancelledAt     DateTime?
+
+  // Pricing (in paise, e.g. ₹50.00 = 5000)
+  subtotalPaise   Int?
+  deliveryPaise   Int?
+  totalPaise      Int?
+
+  // BullMQ job ID for cancellation on accept
+  expiryJobId     String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id])
+  pharmacy Pharmacy? @relation("PharmacyOrders", fields: [pharmacyId], references: [id])
+  rider    Rider?    @relation(fields: [riderId], references: [id])
+
+  @@index([status])
+  @@index([userId])
+  @@index([pharmacyId])
+  @@index([riderId])
+  @@index([flashExpiresAt])
+}
+
+// ─────────────────────────────────────────
+// REFRESH TOKENS (rotation-based)
+// ─────────────────────────────────────────
+
+model RefreshToken {
+  id          String   @id @default(cuid())
+  tokenHash   String   @unique  // SHA-256 hash (never store raw)
+  actorId     String            // userId | pharmacyId | riderId
+  actorRole   UserRole
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  // Polymorphic relations — only one will be non-null
+  userId      String?
+  pharmacyId  String?
+  riderId     String?
+
+  user        User?     @relation(fields: [userId],     references: [id], onDelete: Cascade)
+  pharmacy    Pharmacy? @relation(fields: [pharmacyId], references: [id], onDelete: Cascade)
+  rider       Rider?    @relation(fields: [riderId],    references: [id], onDelete: Cascade)
+
+  @@index([actorId])
+  @@index([tokenHash])
+}
