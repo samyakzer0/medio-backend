@@ -15,8 +15,12 @@ const memoryStore = new Map();
 export async function connectRedis() {
   client = createClient({ url: env.REDIS_URL });
   
+  let warned = false;
   client.on('error', (err) => {
-    console.warn('[REDIS] Warning: Redis client connection error. Fallback to in-memory mode.', err.message);
+    if (!warned) {
+      console.warn('[REDIS] Warning: Redis client connection error. Fallback to in-memory mode.', err.message);
+      warned = true;
+    }
     isRedisActive = false;
   });
 
@@ -31,6 +35,9 @@ export async function connectRedis() {
   } catch (err) {
     console.warn('⚠️ Redis not available. Running in in-memory fallback mode.');
     isRedisActive = false;
+    try {
+      await client.disconnect();
+    } catch (e) {}
     
     // Create a mock client that matches required methods to prevent crashes
     client = {
